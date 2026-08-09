@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>ko</string>
+    <key>CFBundleDisplayName</key>
+    <string>윈도우탭노트</string>
+    <key>CFBundleExecutable</key>
+    <string>WindowsTabNote</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>CFBundleIdentifier</key>
+    <string>local.codex.windowstabnote</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>WindowsTabNote</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>2026.8.9</string>
+    <key>CFBundleVersion</key>
+	<string>22</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+    <key>CFBundleDocumentTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>텍스트 문서</string>
+            <key>CFBundleTypeRole</key>
+            <string>Editor</string>
+            <key>LSHandlerRank</key>
+            <string>Alternate</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>public.text</string>
+                <string>public.plain-text</string>
+                <string>public.source-code</string>
+            </array>
+        </dict>
+    </array>
+</dict>
+</plist>
