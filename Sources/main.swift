@@ -3,7 +3,7 @@ import UniformTypeIdentifiers
 
 private let appDisplayName = "윈도우탭노트"
 private let appEnglishName = "WindowsTabNote"
-private let appDisplayVersion = "2026.08.09.022"
+private let appDisplayVersion = "2026.08.09.024"
 
 private enum TabTitleBuilder {
     static let fallback = "제목 없음"
@@ -200,7 +200,7 @@ private final class FlippedView: NSView {
     override var isFlipped: Bool { true }
 }
 
-private enum LineEnding {
+private enum LineEnding: String, Codable {
     case crlf
     case lf
     case cr
@@ -232,6 +232,67 @@ private enum LineEnding {
         case .lf: return normalized
         case .cr: return normalized.replacingOccurrences(of: "\n", with: "\r")
         }
+    }
+}
+
+private struct SessionTabState: Codable {
+    let urlPath: String?
+    let text: String?
+    let encodingRawValue: UInt
+    let lineEnding: LineEnding
+    let isDirty: Bool
+    let selectionLocation: Int
+    let selectionLength: Int
+}
+
+private struct AppSessionState: Codable {
+    let version: Int
+    let tabs: [SessionTabState]
+    let activeTabIndex: Int
+    let wordWrapEnabled: Bool
+    let editorFontSize: Double
+    let windowFrame: String?
+}
+
+private enum SessionStore {
+    private static var directoryURL: URL {
+        if let overridePath = ProcessInfo.processInfo.environment["WINDOWSTABNOTE_SESSION_DIRECTORY"],
+           !overridePath.isEmpty {
+            return URL(fileURLWithPath: overridePath, isDirectory: true)
+        }
+        let applicationSupport = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first!
+        return applicationSupport.appendingPathComponent(appEnglishName, isDirectory: true)
+    }
+
+    private static var fileURL: URL {
+        directoryURL.appendingPathComponent("Session.json", isDirectory: false)
+    }
+
+    static func load() -> AppSessionState? {
+        guard let data = try? Data(contentsOf: fileURL),
+              let state = try? JSONDecoder().decode(AppSessionState.self, from: data),
+              state.version == 1,
+              !state.tabs.isEmpty else { return nil }
+        return state
+    }
+
+    static func save(_ state: AppSessionState) throws {
+        let fileManager = FileManager.default
+        try fileManager.createDirectory(
+            at: directoryURL,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let data = try JSONEncoder().encode(state)
+        try data.write(to: fileURL, options: .atomic)
+        try? fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
+    }
+
+    static func clear() {
+        try? FileManager.default.removeItem(at: fileURL)
     }
 }
 
@@ -405,6 +466,11 @@ private final class MainWindowController: NSWindowController,
     private var rapidCloseTabWidth: CGFloat?
     private var keyboardMonitor: Any?
     private var mouseMonitor: Any?
+    private var sessionSaveWorkItem: DispatchWorkItem?
+    private let sessionWriteQueue = DispatchQueue(
+        label: "local.codex.windowstabnote.session",
+        qos: .utility
+    )
     private var statusUpdateGeneration = 0
     private var statusCharacterBuffer = [unichar](repeating: 0, count: 8_192)
 
@@ -467,7 +533,9 @@ private final class MainWindowController: NSWindowController,
         window.minSize = NSSize(width: 340, height: 220)
         configureMainMenu()
         installKeyboardShortcuts()
-        createNewTab()
+        if !restoreSession() {
+            createNewTab()
+        }
     }
 
     required init?(coder: NSCoder) {
@@ -475,6 +543,7 @@ private final class MainWindowController: NSWindowController,
     }
 
     deinit {
+        sessionSaveWorkItem?.cancel()
         NotificationCenter.default.removeObserver(self)
         if let keyboardMonitor {
             NSEvent.removeMonitor(keyboardMonitor)
@@ -1017,6 +1086,120 @@ private final class MainWindowController: NSWindowController,
         focusEditor()
     }
 
+    private func restoreSession() -> Bool {
+        guard let state = SessionStore.load() else { return false }
+
+        wordWrapEnabled = state.wordWrapEnabled
+        editorFontSize = CGFloat(min(48, max(8, state.editorFontSize)))
+        if let savedFrame = state.windowFrame {
+            _ = window?.setFrame(from: savedFrame)
+        }
+
+        var documentsToLoad: [(UUID, URL)] = []
+        for tabState in state.tabs {
+            let url = tabState.urlPath.map { URL(fileURLWithPath: $0).standardizedFileURL }
+            let document = DocumentTab(
+                text: tabState.text ?? "",
+                url: url,
+                encoding: String.Encoding(rawValue: tabState.encodingRawValue)
+            )
+            document.lineEnding = tabState.lineEnding
+            document.isDirty = tabState.isDirty
+            if tabState.text == nil, let url {
+                document.isLoading = true
+                document.textView.isEditable = false
+                documentsToLoad.append((document.id, url))
+            }
+            configure(document: document)
+
+            let textLength = document.textView.string.utf16.count
+            let location = min(max(0, tabState.selectionLocation), textLength)
+            let length = min(max(0, tabState.selectionLength), textLength - location)
+            document.textView.setSelectedRange(NSRange(location: location, length: length))
+            documents.append(document)
+        }
+
+        guard !documents.isEmpty else { return false }
+        let activeIndex = min(max(0, state.activeTabIndex), documents.count - 1)
+        activeDocumentID = documents[activeIndex].id
+        refreshTabs()
+        showActiveDocument()
+        if let activeDocument {
+            activeDocument.textView.scrollRangeToVisible(activeDocument.textView.selectedRange())
+        }
+
+        for (documentID, url) in documentsToLoad {
+            loadContents(documentID: documentID, from: url)
+        }
+        return true
+    }
+
+    private func makeSessionState() -> AppSessionState? {
+        guard !documents.isEmpty else { return nil }
+        let tabs = documents.map { document in
+            let selection = document.textView.selectedRange()
+            return SessionTabState(
+                urlPath: document.url?.standardizedFileURL.path,
+                text: document.isLoading ? nil : document.textView.string,
+                encodingRawValue: document.encoding.rawValue,
+                lineEnding: document.lineEnding,
+                isDirty: document.isDirty,
+                selectionLocation: selection.location,
+                selectionLength: selection.length
+            )
+        }
+        let activeIndex = activeDocumentID.flatMap { activeID in
+            documents.firstIndex(where: { $0.id == activeID })
+        } ?? 0
+        return AppSessionState(
+            version: 1,
+            tabs: tabs,
+            activeTabIndex: activeIndex,
+            wordWrapEnabled: wordWrapEnabled,
+            editorFontSize: Double(editorFontSize),
+            windowFrame: window?.frameDescriptor
+        )
+    }
+
+    private func scheduleSessionSave() {
+        guard !terminationWasApproved else { return }
+        sessionSaveWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self, let state = self.makeSessionState() else { return }
+            self.sessionWriteQueue.async {
+                do {
+                    try SessionStore.save(state)
+                } catch {
+                    NSLog("Session autosave failed: %@", error.localizedDescription)
+                }
+            }
+        }
+        sessionSaveWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.7, execute: workItem)
+    }
+
+    private func persistSessionSynchronously() {
+        sessionSaveWorkItem?.cancel()
+        guard let state = makeSessionState() else {
+            clearSessionSynchronously()
+            return
+        }
+        sessionWriteQueue.sync {
+            do {
+                try SessionStore.save(state)
+            } catch {
+                NSLog("Session save failed: %@", error.localizedDescription)
+            }
+        }
+    }
+
+    private func clearSessionSynchronously() {
+        sessionSaveWorkItem?.cancel()
+        sessionWriteQueue.sync {
+            SessionStore.clear()
+        }
+    }
+
     func open(urls: [URL]) {
         for url in urls where url.isFileURL {
             open(url: url)
@@ -1031,6 +1214,7 @@ private final class MainWindowController: NSWindowController,
         activeDocumentID = document.id
         refreshTabs()
         showActiveDocument()
+        scheduleSessionSave()
     }
 
     private func configure(document: DocumentTab) {
@@ -1074,13 +1258,17 @@ private final class MainWindowController: NSWindowController,
         activeDocumentID = document.id
         refreshTabs()
         showActiveDocument()
+        scheduleSessionSave()
 
-        let documentID = document.id
+        loadContents(documentID: document.id, from: standardizedURL)
+    }
+
+    private func loadContents(documentID: UUID, from url: URL) {
         DispatchQueue.global(qos: .userInitiated).async {
             let result: Result<(String, String.Encoding, LineEnding), Error>
             do {
                 var detectedEncoding = String.Encoding.utf8
-                let contents = try String(contentsOf: standardizedURL, usedEncoding: &detectedEncoding)
+                let contents = try String(contentsOf: url, usedEncoding: &detectedEncoding)
                 let lineEnding = contents.isEmpty ? LineEnding.crlf : LineEnding.detect(in: contents)
                 result = .success((lineEnding.normalizedForEditing(contents), detectedEncoding, lineEnding))
             } catch {
@@ -1088,7 +1276,7 @@ private final class MainWindowController: NSWindowController,
             }
 
             DispatchQueue.main.async { [weak self] in
-                self?.finishOpening(documentID: documentID, url: standardizedURL, result: result)
+                self?.finishOpening(documentID: documentID, url: url, result: result)
             }
         }
     }
@@ -1116,6 +1304,7 @@ private final class MainWindowController: NSWindowController,
                 updateStatusBar()
                 focusEditor()
             }
+            scheduleSessionSave()
         case let .failure(error):
             document.isLoading = false
             remove(document: document)
@@ -1399,6 +1588,7 @@ private final class MainWindowController: NSWindowController,
             NSDocumentController.shared.noteNewRecentDocumentURL(destination)
             refreshTabs()
             updateStatusBar()
+            scheduleSessionSave()
             return true
         } catch {
             presentError(title: "파일을 저장할 수 없습니다", message: error.localizedDescription)
@@ -1445,6 +1635,7 @@ private final class MainWindowController: NSWindowController,
         }
         refreshTabs()
         showActiveDocument()
+        scheduleSessionSave()
     }
 
     private func close(document: DocumentTab) {
@@ -1453,6 +1644,10 @@ private final class MainWindowController: NSWindowController,
             return
         }
         guard confirmClose(document: document) else { return }
+        unregister(document: document)
+        documents.removeAll()
+        activeDocumentID = nil
+        clearSessionSynchronously()
         terminationWasApproved = true
         NSApp.terminate(nil)
     }
@@ -1506,12 +1701,7 @@ private final class MainWindowController: NSWindowController,
 
     func requestApplicationTermination() -> Bool {
         if terminationWasApproved { return true }
-        for document in documents where document.isDirty {
-            activeDocumentID = document.id
-            refreshTabs()
-            showActiveDocument()
-            guard confirmClose(document: document) else { return false }
-        }
+        persistSessionSynchronously()
         terminationWasApproved = true
         return true
     }
@@ -1530,6 +1720,7 @@ private final class MainWindowController: NSWindowController,
         activeDocumentID = id
         refreshTabs()
         showActiveDocument()
+        scheduleSessionSave()
     }
 
     func closeTab(id: UUID) {
@@ -1557,22 +1748,27 @@ private final class MainWindowController: NSWindowController,
         if document.id == activeDocumentID {
             scheduleStatusBarUpdate()
         }
+        scheduleSessionSave()
     }
 
     func textViewDidChangeSelection(_ notification: Notification) {
         guard let textView = notification.object as? NSTextView,
               textView === activeDocument?.textView else { return }
         scheduleStatusBarUpdate()
+        scheduleSessionSave()
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
-        return requestApplicationTermination()
+        persistSessionSynchronously()
+        terminationWasApproved = true
+        return true
     }
 
     @objc func windowDidResize(_ notification: Notification) {
         resetRapidTabClosing()
         updateResponsiveLayout()
         refreshTabs()
+        scheduleSessionSave()
     }
 
     func windowWillResize(_ sender: NSWindow, to frameSize: NSSize) -> NSSize {
@@ -1774,6 +1970,7 @@ private final class MainWindowController: NSWindowController,
         sender.state = wordWrapEnabled ? .on : .off
         documents.forEach(applyWordWrap)
         activeDocument?.textView.needsDisplay = true
+        scheduleSessionSave()
     }
 
     @objc private func zoomInAction(_ sender: Any?) {
@@ -1796,6 +1993,7 @@ private final class MainWindowController: NSWindowController,
             ?? .monospacedSystemFont(ofSize: editorFontSize, weight: .regular)
         documents.forEach { $0.textView.font = font }
         updateStatusBar()
+        scheduleSessionSave()
     }
 
     @objc private func goToLineAction(_ sender: Any?) {
