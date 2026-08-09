@@ -459,6 +459,7 @@ private final class MainWindowController: NSWindowController,
     private var editorFontSize: CGFloat = 14
     private var terminationWasApproved = false
     private var documentByTextView: [ObjectIdentifier: DocumentTab] = [:]
+    private var restoredSelectionByDocumentID: [UUID: NSRange] = [:]
     private var tabButtonsByID: [UUID: TabButtonView] = [:]
     private var tabWidthConstraintsByID: [UUID: NSLayoutConstraint] = [:]
     private var rapidCloseAnchorX: CGFloat?
@@ -1109,13 +1110,19 @@ private final class MainWindowController: NSWindowController,
                 document.isLoading = true
                 document.textView.isEditable = false
                 documentsToLoad.append((document.id, url))
+                restoredSelectionByDocumentID[document.id] = NSRange(
+                    location: max(0, tabState.selectionLocation),
+                    length: max(0, tabState.selectionLength)
+                )
             }
             configure(document: document)
 
-            let textLength = document.textView.string.utf16.count
-            let location = min(max(0, tabState.selectionLocation), textLength)
-            let length = min(max(0, tabState.selectionLength), textLength - location)
-            document.textView.setSelectedRange(NSRange(location: location, length: length))
+            if tabState.text != nil {
+                let textLength = document.textView.string.utf16.count
+                let location = min(max(0, tabState.selectionLocation), textLength)
+                let length = min(max(0, tabState.selectionLength), textLength - location)
+                document.textView.setSelectedRange(NSRange(location: location, length: length))
+            }
             documents.append(document)
         }
 
@@ -1140,7 +1147,9 @@ private final class MainWindowController: NSWindowController,
             let selection = document.textView.selectedRange()
             return SessionTabState(
                 urlPath: document.url?.standardizedFileURL.path,
-                text: document.isLoading ? nil : document.textView.string,
+                text: document.isLoading || (document.url != nil && !document.isDirty)
+                    ? nil
+                    : document.textView.string,
                 encodingRawValue: document.encoding.rawValue,
                 lineEnding: document.lineEnding,
                 isDirty: document.isDirty,
@@ -1230,6 +1239,7 @@ private final class MainWindowController: NSWindowController,
     private func unregister(document: DocumentTab) {
         document.textView.delegate = nil
         documentByTextView.removeValue(forKey: ObjectIdentifier(document.textView))
+        restoredSelectionByDocumentID.removeValue(forKey: document.id)
     }
 
     private func open(url: URL) {
@@ -1289,8 +1299,14 @@ private final class MainWindowController: NSWindowController,
         switch result {
         case let .success((contents, encoding, lineEnding)):
             document.textView.string = contents
-            document.textView.setSelectedRange(NSRange(location: 0, length: 0))
-            document.textView.scrollRangeToVisible(NSRange(location: 0, length: 0))
+            let requestedSelection = restoredSelectionByDocumentID.removeValue(forKey: document.id)
+                ?? NSRange(location: 0, length: 0)
+            let textLength = contents.utf16.count
+            let location = min(requestedSelection.location, textLength)
+            let length = min(requestedSelection.length, textLength - location)
+            let restoredSelection = NSRange(location: location, length: length)
+            document.textView.setSelectedRange(restoredSelection)
+            document.textView.scrollRangeToVisible(restoredSelection)
             document.encoding = encoding
             document.lineEnding = lineEnding
             document.isLoading = false
@@ -1306,6 +1322,7 @@ private final class MainWindowController: NSWindowController,
             }
             scheduleSessionSave()
         case let .failure(error):
+            restoredSelectionByDocumentID.removeValue(forKey: document.id)
             document.isLoading = false
             remove(document: document)
             presentError(
@@ -1755,7 +1772,6 @@ private final class MainWindowController: NSWindowController,
         guard let textView = notification.object as? NSTextView,
               textView === activeDocument?.textView else { return }
         scheduleStatusBarUpdate()
-        scheduleSessionSave()
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
