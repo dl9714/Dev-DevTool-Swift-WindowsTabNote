@@ -151,6 +151,15 @@ private extension MainWindowController {
         check(tabScrollView.contentView.bounds.maxX >= tabButtonsByID[ids.last!]!.frame.maxX,
               "New active tab scrolls into view")
         let activeID = activeDocumentID
+        beginRenamingTab(id: ids[0])
+        RunLoop.main.run(until: Date().addingTimeInterval(0.03))
+        check(activeDocumentID == ids[0], "First click switches to an inactive tab")
+        check(tabButtonsByID[ids[0]]?.isRenaming == false, "First click does not start renaming")
+        beginRenamingTab(id: ids[0])
+        RunLoop.main.run(until: Date().addingTimeInterval(0.03))
+        check(tabButtonsByID[ids[0]]?.isRenaming == true, "Second click on the selected tab starts renaming")
+        tabButtonsByID[ids[0]]?.finishRenaming(commit: false)
+        selectTab(id: activeID!)
         let originalEditor = documents[0].textView
         check(moveTab(id: ids[0], to: 39), "First tab can move to the end")
         refreshTabs()

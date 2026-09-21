@@ -3,7 +3,7 @@ import UniformTypeIdentifiers
 
 private let appDisplayName = "윈도우탭노트"
 private let appEnglishName = "WindowsTabNote"
-private let appDisplayVersion = "2026.09.21.028"
+private let appDisplayVersion = "2026.09.21.030"
 
 private enum TabTitleBuilder {
     static let fallback = "제목 없음"
@@ -619,7 +619,8 @@ private final class TabButtonView: NSView, NSTextFieldDelegate {
 
     func update(title: String, selected: Bool, toolTip: String?) {
         titleButton.title = title
-        titleButton.toolTip = "\(toolTip ?? title)\n클릭: 이름 변경 · 드래그: 순서 변경 · 가운데 클릭: 닫기"
+        let clickHint = selected ? "다시 클릭: 이름 변경" : "클릭: 탭 선택"
+        titleButton.toolTip = "\(toolTip ?? title)\n\(clickHint) · 드래그: 순서 변경 · 가운데 클릭: 닫기"
         titleField.textColor = WindowsPalette.text
         titleField.backgroundColor = WindowsPalette.editor
         titleButton.contentTintColor = selected ? WindowsPalette.text : WindowsPalette.secondaryText
@@ -1907,6 +1908,10 @@ private final class MainWindowController: NSWindowController,
     }
 
     func beginRenamingTab(id: UUID) {
+        guard activeDocumentID == id else {
+            selectTab(id: id)
+            return
+        }
         selectTab(id: id)
         // Selecting a tab also schedules editor focus. Begin after that work.
         DispatchQueue.main.async { [weak self] in
