@@ -104,20 +104,56 @@ private final class RenameDelegateCheck: TabButtonDelegate {
     func dragTab(id: UUID, to point: NSPoint) {}
     func endDraggingTab(id: UUID) {}
 }
+private extension TabButtonView {
+    var nameEditorForChecks: TabRenameEditor { renameEditor! }
+    func dismissNamePopoverForChecks() {
+        popoverWillClose(Notification(name: NSPopover.willCloseNotification, object: renamePopover))
+    }
+}
 private let renameDelegate = RenameDelegateCheck()
 private let tabView = TabButtonView(tabID: UUID(), delegate: renameDelegate)
-checkWindow.contentView = tabView
-tabView.frame = NSRect(x: 0, y: 0, width: 240, height: 36)
+private let tabCheckHost = NSView(frame: checkWindow.contentView!.bounds)
+checkWindow.contentView = tabCheckHost
+tabCheckHost.addSubview(tabView)
+tabView.frame = NSRect(x: 0, y: 0, width: 80, height: 36)
+// Unit checks host the popover content offscreen; the installed app is tested with Computer Use.
+private let renameCheckWindow = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 420, height: 138),
+                                         styleMask: [.titled], backing: .buffered, defer: false)
+private func nameFieldForChecks() -> NSTextField {
+    let editor = tabView.nameEditorForChecks
+    renameCheckWindow.setContentSize(NSSize(width: editor.preferredWidth, height: 138))
+    renameCheckWindow.contentView = editor.view
+    editor.view.layoutSubtreeIfNeeded()
+    editor.viewDidAppear()
+    return editor.nameField
+}
 tabView.beginRenaming(title: "Old name")
-private let field = tabView.subviews.compactMap { $0 as? NSTextField }.first!
+private var field = nameFieldForChecks()
+check(tabView.nameEditorForChecks.view.bounds.width >= 300, "Name popover stays wide above an 80-point tab")
+check(field.bounds.width >= 280, "Name field has room for a long title: \(field.bounds.width)")
+check(TabRenameEditor.width(for: 340) <= 316, "Name popover fits inside the smallest window")
+check(TabRenameEditor.width(for: 920) == 420, "Name popover has comfortable width in larger windows")
 check(field.currentEditor()?.selectedRange == NSRange(location: 0, length: 8), "Rename selects the whole name")
 field.currentEditor()?.string = "New name"
 tabView.finishRenaming(commit: true)
 check(renameDelegate.committed == "New name" && !tabView.isRenaming, "Rename commits edited text: committed=\(String(describing: renameDelegate.committed)), editing=\(tabView.isRenaming)")
 tabView.beginRenaming(title: "New name")
+field = nameFieldForChecks()
 field.currentEditor()?.string = "Cancelled name"
 tabView.finishRenaming(commit: false)
 check(renameDelegate.committed == "New name", "Escape keeps the previous name")
+tabView.beginRenaming(title: "New name")
+field = nameFieldForChecks()
+field.currentEditor()?.string = "Outside click name"
+tabView.dismissNamePopoverForChecks()
+check(renameDelegate.committed == "Outside click name" && !tabView.isRenaming,
+      "Dismissing the popover commits the current name")
+tabView.beginRenaming(title: "New name")
+field = nameFieldForChecks()
+field.currentEditor()?.string = "   "
+tabView.nameEditorForChecks.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification))
+check(!tabView.nameEditorForChecks.confirmButton.isEnabled, "Whitespace-only names cannot be confirmed")
+tabView.finishRenaming(commit: false)
 
 
 

@@ -3,7 +3,7 @@ import UniformTypeIdentifiers
 
 private let appDisplayName = "윈도우탭노트"
 private let appEnglishName = "WindowsTabNote"
-private let appDisplayVersion = "2026.09.21.030"
+private let appDisplayVersion = "2026.09.21.034"
 
 private enum TabTitleBuilder {
     static let fallback = "제목 없음"
@@ -525,13 +525,127 @@ private protocol TabButtonDelegate: AnyObject {
     func endDraggingTab(id: UUID)
 }
 
-private final class TabButtonView: NSView, NSTextFieldDelegate {
+private final class TabRenameEditor: NSViewController, NSTextFieldDelegate {
+    let nameField = NSTextField()
+    let confirmButton = NSButton(title: "변경", target: nil, action: nil)
+    var onFinish: ((Bool) -> Void)?
+    private let initialTitle: String
+    let preferredWidth: CGFloat
+
+    static func width(for windowWidth: CGFloat) -> CGFloat {
+        min(420, max(300, windowWidth - 24))
+    }
+
+    init(title: String, width: CGFloat = 420) {
+        initialTitle = title
+        preferredWidth = width
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func loadView() {
+        view = NSView(frame: NSRect(x: 0, y: 0, width: preferredWidth, height: 138))
+        let heading = NSTextField(labelWithString: "탭 이름 변경")
+        heading.font = .systemFont(ofSize: 14, weight: .semibold)
+        heading.textColor = WindowsPalette.text
+        let hint = NSTextField(labelWithString: "Enter로 변경 · Esc로 취소")
+        hint.font = .systemFont(ofSize: 11)
+        hint.textColor = WindowsPalette.secondaryText
+
+        nameField.stringValue = initialTitle
+        nameField.font = .systemFont(ofSize: 15)
+        nameField.textColor = WindowsPalette.text
+        nameField.backgroundColor = WindowsPalette.editor
+        nameField.isEditable = true
+        nameField.isSelectable = true
+        nameField.isBezeled = true
+        nameField.bezelStyle = .roundedBezel
+        nameField.usesSingleLineMode = true
+        nameField.cell?.isScrollable = true
+        nameField.delegate = self
+        nameField.setAccessibilityLabel("탭 이름")
+        nameField.placeholderString = "탭 이름을 입력하세요"
+
+        confirmButton.target = self
+        confirmButton.action = #selector(confirmName(_:))
+        confirmButton.bezelStyle = .rounded
+        confirmButton.keyEquivalent = "\r"
+        let cancelButton = NSButton(title: "취소", target: self, action: #selector(cancelName(_:)))
+        cancelButton.bezelStyle = .rounded
+        cancelButton.keyEquivalent = "\u{1b}"
+
+        for control in [heading, nameField, hint, cancelButton, confirmButton] {
+            control.translatesAutoresizingMaskIntoConstraints = false
+            view.addSubview(control)
+        }
+        NSLayoutConstraint.activate([
+            heading.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16),
+            heading.topAnchor.constraint(equalTo: view.topAnchor, constant: 14),
+            nameField.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16),
+            nameField.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
+            nameField.topAnchor.constraint(equalTo: heading.bottomAnchor, constant: 10),
+            nameField.heightAnchor.constraint(equalToConstant: 32),
+            confirmButton.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
+            confirmButton.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -14),
+            confirmButton.widthAnchor.constraint(equalToConstant: 64),
+            cancelButton.trailingAnchor.constraint(equalTo: confirmButton.leadingAnchor, constant: -8),
+            cancelButton.centerYAnchor.constraint(equalTo: confirmButton.centerYAnchor),
+            cancelButton.widthAnchor.constraint(equalToConstant: 64),
+            hint.leadingAnchor.constraint(equalTo: nameField.leadingAnchor),
+            hint.centerYAnchor.constraint(equalTo: confirmButton.centerYAnchor)
+        ])
+        updateValidation()
+    }
+
+    override func viewDidAppear() {
+        super.viewDidAppear()
+        nameField.selectText(nil)
+    }
+
+    var editedTitle: String { nameField.currentEditor()?.string ?? nameField.stringValue }
+
+    private func updateValidation() {
+        confirmButton.isEnabled = !editedTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    func controlTextDidChange(_ notification: Notification) {
+        updateValidation()
+    }
+
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
+        if selector == #selector(NSResponder.insertNewline(_:)) {
+            confirmName(nil)
+            return true
+        }
+        if selector == #selector(NSResponder.cancelOperation(_:)) {
+            cancelName(nil)
+            return true
+        }
+        return false
+    }
+
+    @objc private func confirmName(_ sender: Any?) {
+        updateValidation()
+        guard confirmButton.isEnabled else { NSSound.beep(); return }
+        onFinish?(true)
+    }
+
+    @objc private func cancelName(_ sender: Any?) {
+        onFinish?(false)
+    }
+}
+
+private final class TabButtonView: NSView, NSPopoverDelegate {
     let tabID: UUID
     weak var delegate: TabButtonDelegate?
 
     private let titleButton = TabTitleButton()
     private let closeButton = NSButton()
-    private let titleField = NSTextField()
+    private var renamePopover: NSPopover?
+    private var renameEditor: TabRenameEditor?
     private(set) var isRenaming = false
 
     init(tabID: UUID, delegate: TabButtonDelegate) {
@@ -565,21 +679,6 @@ private final class TabButtonView: NSView, NSTextFieldDelegate {
         }
         titleButton.middleClicked = { [weak self] in self?.closePressed() }
 
-        titleField.font = titleButton.font
-        titleField.isEditable = true
-        titleField.isSelectable = true
-        titleField.isBordered = true
-        titleField.isBezeled = true
-        titleField.bezelStyle = .squareBezel
-        titleField.focusRingType = .exterior
-        titleField.usesSingleLineMode = true
-        titleField.delegate = self
-        titleField.isHidden = true
-        titleField.setAccessibilityLabel("탭 이름")
-        titleField.toolTip = "Enter: 이름 확정 · Esc: 취소"
-        titleField.translatesAutoresizingMaskIntoConstraints = false
-        titleField.setContentCompressionResistancePriority(.init(1), for: .horizontal)
-
         closeButton.title = ""
         closeButton.image = NSImage(
             systemSymbolName: "xmark",
@@ -595,17 +694,12 @@ private final class TabButtonView: NSView, NSTextFieldDelegate {
         closeButton.translatesAutoresizingMaskIntoConstraints = false
 
         addSubview(titleButton)
-        addSubview(titleField)
         addSubview(closeButton)
 
         NSLayoutConstraint.activate([
             titleButton.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
             titleButton.centerYAnchor.constraint(equalTo: centerYAnchor),
             titleButton.trailingAnchor.constraint(equalTo: closeButton.leadingAnchor, constant: -3),
-            titleField.leadingAnchor.constraint(equalTo: titleButton.leadingAnchor, constant: -3),
-            titleField.centerYAnchor.constraint(equalTo: centerYAnchor),
-            titleField.trailingAnchor.constraint(equalTo: titleButton.trailingAnchor),
-            titleField.heightAnchor.constraint(equalToConstant: 24),
             closeButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -5),
             closeButton.centerYAnchor.constraint(equalTo: centerYAnchor),
             closeButton.widthAnchor.constraint(equalToConstant: 24),
@@ -621,8 +715,6 @@ private final class TabButtonView: NSView, NSTextFieldDelegate {
         titleButton.title = title
         let clickHint = selected ? "다시 클릭: 이름 변경" : "클릭: 탭 선택"
         titleButton.toolTip = "\(toolTip ?? title)\n\(clickHint) · 드래그: 순서 변경 · 가운데 클릭: 닫기"
-        titleField.textColor = WindowsPalette.text
-        titleField.backgroundColor = WindowsPalette.editor
         titleButton.contentTintColor = selected ? WindowsPalette.text : WindowsPalette.secondaryText
         closeButton.contentTintColor = selected ? WindowsPalette.text : WindowsPalette.secondaryText
         layer?.backgroundColor = selected ? WindowsPalette.selectedTab.cgColor : NSColor.clear.cgColor
@@ -635,38 +727,49 @@ private final class TabButtonView: NSView, NSTextFieldDelegate {
     }
 
     func beginRenaming(title: String) {
-        guard !isRenaming, window != nil else { return }
+        guard !isRenaming, let window else { return }
+        let width = TabRenameEditor.width(for: window.contentView?.bounds.width ?? 444)
+        let editor = TabRenameEditor(title: title, width: width)
+        let popover = NSPopover()
+        popover.contentViewController = editor
+        popover.contentSize = NSSize(width: width, height: 138)
+        popover.behavior = .transient
+        popover.animates = false
+        popover.appearance = window.effectiveAppearance
+        popover.delegate = self
+        editor.onFinish = { [weak self] commit in
+            guard let self else { return }
+            self.finishRenaming(commit: commit)
+            self.delegate?.selectTab(id: self.tabID)
+        }
+        renameEditor = editor
+        renamePopover = popover
         isRenaming = true
-        titleField.stringValue = title
-        titleButton.isHidden = true
-        titleField.isHidden = false
-        titleField.selectText(nil)
+        // Anchor to the visible part, even when the strip is scrolled at an edge.
+        let anchor = bounds.intersection(visibleRect)
+        popover.show(relativeTo: anchor.isEmpty ? bounds : anchor, of: self, preferredEdge: .minY)
     }
 
     func finishRenaming(commit: Bool) {
+        finishRenaming(commit: commit, closePopover: true)
+    }
+
+    private func finishRenaming(commit: Bool, closePopover: Bool) {
         guard isRenaming else { return }
-        let title = titleField.currentEditor()?.string ?? titleField.stringValue
+        let title = renameEditor?.editedTitle ?? titleButton.title
+        let popover = renamePopover
         isRenaming = false
-        _ = titleField.abortEditing()
-        titleField.isHidden = true
-        titleButton.isHidden = false
-        if commit {
-            delegate?.renameTab(id: tabID, title: title)
-        }
+        renameEditor?.onFinish = nil
+        renameEditor = nil
+        renamePopover = nil
+        popover?.delegate = nil
+        if commit { delegate?.renameTab(id: tabID, title: title) }
+        if closePopover { popover?.close() }
     }
 
-    func controlTextDidEndEditing(_ notification: Notification) {
-        finishRenaming(commit: true)
-    }
-
-    func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
-        if commandSelector == #selector(NSResponder.insertNewline(_:)) ||
-            commandSelector == #selector(NSResponder.cancelOperation(_:)) {
-            finishRenaming(commit: commandSelector == #selector(NSResponder.insertNewline(_:)))
-            delegate?.selectTab(id: tabID)
-            return true
-        }
-        return false
+    func popoverWillClose(_ notification: Notification) {
+        // Clicking outside saves the edit, as the inline editor did.
+        finishRenaming(commit: true, closePopover: false)
     }
 
     @objc private func closePressed() {
