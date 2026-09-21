@@ -3,7 +3,7 @@ import UniformTypeIdentifiers
 
 private let appDisplayName = "윈도우탭노트"
 private let appEnglishName = "WindowsTabNote"
-private let appDisplayVersion = "2026.08.09.024"
+private let appDisplayVersion = "2026.09.21.026"
 
 private enum TabTitleBuilder {
     static let fallback = "제목 없음"
@@ -238,6 +238,7 @@ private enum LineEnding: String, Codable {
 private struct SessionTabState: Codable {
     let urlPath: String?
     let text: String?
+    let customTitle: String?
     let encodingRawValue: UInt
     let lineEnding: LineEnding
     let isDirty: Bool
@@ -296,6 +297,67 @@ private enum SessionStore {
     }
 }
 
+private final class WindowsTextView: NSTextView {
+    private var boundaryAnchor: Int?
+    private var boundaryCaret: Int?
+    private var isMovingBoundary = false
+
+    override func setSelectedRanges(_ ranges: [NSValue], affinity: NSSelectionAffinity, stillSelecting flag: Bool) {
+        if !isMovingBoundary {
+            boundaryAnchor = nil
+            boundaryCaret = nil
+        }
+        super.setSelectedRanges(ranges, affinity: affinity, stillSelecting: flag)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        boundaryAnchor = nil
+        boundaryCaret = nil
+        super.mouseDown(with: event)
+    }
+
+    override func keyDown(with event: NSEvent) {
+        // Ignore the function flag: dedicated Home/End and Fn+arrows both set it.
+        let modifiers = event.modifierFlags.intersection([.command, .option, .control, .shift])
+        guard (event.keyCode == 115 || event.keyCode == 119),
+              modifiers.intersection([.command, .option]).isEmpty,
+              !hasMarkedText() else {
+            boundaryAnchor = nil
+            boundaryCaret = nil
+            super.keyDown(with: event)
+            return
+        }
+
+        let home = event.keyCode == 115
+        let document = modifiers.contains(.control)
+        let selecting = modifiers.contains(.shift)
+        let selection = selectedRange()
+        let caret = boundaryCaret ?? (selectionAffinity == .upstream ? selection.location : NSMaxRange(selection))
+        let anchor = boundaryAnchor ?? (selectionAffinity == .upstream ? NSMaxRange(selection) : selection.location)
+        isMovingBoundary = true
+        defer { isMovingBoundary = false }
+        setSelectedRange(NSRange(location: caret, length: 0), affinity: selectionAffinity, stillSelecting: false)
+        switch (home, document) {
+        case (true, false): moveToLeftEndOfLine(nil)
+        case (false, false): moveToRightEndOfLine(nil)
+        case (true, true): moveToBeginningOfDocument(nil)
+        case (false, true): moveToEndOfDocument(nil)
+        }
+        let destination = selectedRange().location
+        if selecting {
+            // AppKit's alternating Shift+Home/End resets the anchor. Windows keeps it.
+            boundaryAnchor = anchor
+            boundaryCaret = destination
+            setSelectedRange(NSRange(location: min(anchor, destination), length: abs(destination - anchor)),
+                             affinity: destination < anchor ? .upstream : .downstream, stillSelecting: false)
+        } else {
+            boundaryAnchor = nil
+            boundaryCaret = nil
+        }
+        scrollRangeToVisible(NSRange(location: destination, length: 0))
+    }
+}
+
 private final class DocumentTab {
     let id = UUID()
     var url: URL?
@@ -303,10 +365,11 @@ private final class DocumentTab {
     var lineEnding: LineEnding
     var isDirty = false
     var isLoading = false
+    var customTitle: String?
     private(set) var draftTitle: String
     let containerView = NSView()
     let scrollView = NSScrollView()
-    let textView = NSTextView(frame: .zero)
+    let textView = WindowsTextView(frame: .zero)
 
     init(text: String = "", url: URL? = nil, encoding: String.Encoding = .utf8) {
         self.url = url
@@ -351,7 +414,7 @@ private final class DocumentTab {
     }
 
     var displayTitle: String {
-        url?.lastPathComponent ?? draftTitle
+        customTitle ?? url?.lastPathComponent ?? draftTitle
     }
 
     var tabTitle: String {
@@ -371,14 +434,18 @@ private final class DocumentTab {
 private protocol TabButtonDelegate: AnyObject {
     func selectTab(id: UUID)
     func closeTab(id: UUID)
+    func beginRenamingTab(id: UUID)
+    func renameTab(id: UUID, title: String)
 }
 
-private final class TabButtonView: NSView {
+private final class TabButtonView: NSView, NSTextFieldDelegate {
     let tabID: UUID
     weak var delegate: TabButtonDelegate?
 
     private let titleButton = NSButton()
     private let closeButton = NSButton()
+    private let titleField = NSTextField()
+    private(set) var isRenaming = false
 
     init(tabID: UUID, delegate: TabButtonDelegate) {
         self.tabID = tabID
@@ -397,6 +464,20 @@ private final class TabButtonView: NSView {
         titleButton.action = #selector(selectPressed)
         titleButton.translatesAutoresizingMaskIntoConstraints = false
 
+        titleField.font = titleButton.font
+        titleField.isEditable = true
+        titleField.isSelectable = true
+        titleField.isBordered = true
+        titleField.isBezeled = true
+        titleField.bezelStyle = .squareBezel
+        titleField.focusRingType = .exterior
+        titleField.usesSingleLineMode = true
+        titleField.delegate = self
+        titleField.isHidden = true
+        titleField.setAccessibilityLabel("탭 이름")
+        titleField.toolTip = "Enter: 이름 확정 · Esc: 취소"
+        titleField.translatesAutoresizingMaskIntoConstraints = false
+
         closeButton.title = ""
         closeButton.image = NSImage(
             systemSymbolName: "xmark",
@@ -412,12 +493,17 @@ private final class TabButtonView: NSView {
         closeButton.translatesAutoresizingMaskIntoConstraints = false
 
         addSubview(titleButton)
+        addSubview(titleField)
         addSubview(closeButton)
 
         NSLayoutConstraint.activate([
             titleButton.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
             titleButton.centerYAnchor.constraint(equalTo: centerYAnchor),
             titleButton.trailingAnchor.constraint(equalTo: closeButton.leadingAnchor, constant: -3),
+            titleField.leadingAnchor.constraint(equalTo: titleButton.leadingAnchor, constant: -3),
+            titleField.centerYAnchor.constraint(equalTo: centerYAnchor),
+            titleField.trailingAnchor.constraint(equalTo: titleButton.trailingAnchor),
+            titleField.heightAnchor.constraint(equalToConstant: 24),
             closeButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -5),
             closeButton.centerYAnchor.constraint(equalTo: centerYAnchor),
             closeButton.widthAnchor.constraint(equalToConstant: 24),
@@ -431,7 +517,9 @@ private final class TabButtonView: NSView {
 
     func update(title: String, selected: Bool, toolTip: String?) {
         titleButton.title = title
-        titleButton.toolTip = toolTip ?? title
+        titleButton.toolTip = "\(toolTip ?? title)\n클릭하여 탭 이름 변경"
+        titleField.textColor = WindowsPalette.text
+        titleField.backgroundColor = WindowsPalette.editor
         titleButton.contentTintColor = selected ? WindowsPalette.text : WindowsPalette.secondaryText
         closeButton.contentTintColor = selected ? WindowsPalette.text : WindowsPalette.secondaryText
         layer?.backgroundColor = selected ? WindowsPalette.selectedTab.cgColor : NSColor.clear.cgColor
@@ -440,10 +528,46 @@ private final class TabButtonView: NSView {
     }
 
     @objc private func selectPressed() {
-        delegate?.selectTab(id: tabID)
+        delegate?.beginRenamingTab(id: tabID)
+    }
+
+    func beginRenaming(title: String) {
+        guard !isRenaming, window != nil else { return }
+        isRenaming = true
+        titleField.stringValue = title
+        titleButton.isHidden = true
+        titleField.isHidden = false
+        titleField.selectText(nil)
+    }
+
+    func finishRenaming(commit: Bool) {
+        guard isRenaming else { return }
+        let title = titleField.currentEditor()?.string ?? titleField.stringValue
+        isRenaming = false
+        _ = titleField.abortEditing()
+        titleField.isHidden = true
+        titleButton.isHidden = false
+        if commit {
+            delegate?.renameTab(id: tabID, title: title)
+        }
+    }
+
+    func controlTextDidEndEditing(_ notification: Notification) {
+        finishRenaming(commit: true)
+    }
+
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        if commandSelector == #selector(NSResponder.insertNewline(_:)) ||
+            commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+            finishRenaming(commit: commandSelector == #selector(NSResponder.insertNewline(_:)))
+            delegate?.selectTab(id: tabID)
+            return true
+        }
+        return false
     }
 
     @objc private func closePressed() {
+        finishRenaming(commit: true)
         delegate?.closeTab(id: tabID)
     }
 }
@@ -1105,6 +1229,7 @@ private final class MainWindowController: NSWindowController,
                 encoding: String.Encoding(rawValue: tabState.encodingRawValue)
             )
             document.lineEnding = tabState.lineEnding
+            document.customTitle = tabState.customTitle
             document.isDirty = tabState.isDirty
             if tabState.text == nil, let url {
                 document.isLoading = true
@@ -1150,6 +1275,7 @@ private final class MainWindowController: NSWindowController,
                 text: document.isLoading || (document.url != nil && !document.isDirty)
                     ? nil
                     : document.textView.string,
+                customTitle: document.customTitle,
                 encodingRawValue: document.encoding.rawValue,
                 lineEnding: document.lineEnding,
                 isDirty: document.isDirty,
@@ -1352,7 +1478,9 @@ private final class MainWindowController: NSWindowController,
     private func focusEditor() {
         guard let textView = activeDocument?.textView else { return }
         DispatchQueue.main.async { [weak self, weak textView] in
-            guard let self, let textView else { return }
+            guard let self, let textView,
+                  textView === self.activeDocument?.textView,
+                  !self.tabButtonsByID.values.contains(where: { $0.isRenaming }) else { return }
             self.window?.makeFirstResponder(textView)
         }
     }
@@ -1415,6 +1543,7 @@ private final class MainWindowController: NSWindowController,
         let currentIDs = tabStack.arrangedSubviews.compactMap { ($0 as? TabButtonView)?.tabID }
         let wantedIDs = layout.visibleDocuments.map(\.id)
         if currentIDs != wantedIDs {
+            tabButtonsByID.values.forEach { $0.finishRenaming(commit: true) }
             tabButtonsByID.removeAll(keepingCapacity: true)
             tabWidthConstraintsByID.removeAll(keepingCapacity: true)
             for view in tabStack.arrangedSubviews {
@@ -1718,6 +1847,7 @@ private final class MainWindowController: NSWindowController,
 
     func requestApplicationTermination() -> Bool {
         if terminationWasApproved { return true }
+        tabButtonsByID.values.forEach { $0.finishRenaming(commit: true) }
         persistSessionSynchronously()
         terminationWasApproved = true
         return true
@@ -1733,10 +1863,31 @@ private final class MainWindowController: NSWindowController,
 
     func selectTab(id: UUID) {
         guard documents.contains(where: { $0.id == id }) else { return }
+        tabButtonsByID.values.forEach { $0.finishRenaming(commit: true) }
         resetRapidTabClosing()
         activeDocumentID = id
         refreshTabs()
         showActiveDocument()
+        scheduleSessionSave()
+    }
+
+    func beginRenamingTab(id: UUID) {
+        selectTab(id: id)
+        // Selecting a tab also schedules editor focus. Begin after that work.
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let document = self.activeDocument, document.id == id else { return }
+            self.tabButtonsByID[id]?.beginRenaming(title: document.displayTitle)
+        }
+    }
+
+    func renameTab(id: UUID, title: String) {
+        let title = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty,
+              let document = documents.first(where: { $0.id == id }),
+              title != document.displayTitle else { return }
+        document.customTitle = title
+        updateTabAppearance(for: document)
+        updateWindowTitle()
         scheduleSessionSave()
     }
 
@@ -1775,6 +1926,7 @@ private final class MainWindowController: NSWindowController,
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
+        tabButtonsByID.values.forEach { $0.finishRenaming(commit: true) }
         persistSessionSynchronously()
         terminationWasApproved = true
         return true
@@ -2138,8 +2290,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+#if !BEHAVIOR_CHECKS
 private let application = NSApplication.shared
 private let appDelegate = AppDelegate()
 application.setActivationPolicy(.regular)
 application.delegate = appDelegate
 application.run()
+#endif
