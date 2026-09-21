@@ -100,6 +100,9 @@ private final class RenameDelegateCheck: TabButtonDelegate {
     func closeTab(id: UUID) {}
     func beginRenamingTab(id: UUID) {}
     func renameTab(id: UUID, title: String) { committed = title }
+    func beginDraggingTab(id: UUID, at point: NSPoint) {}
+    func dragTab(id: UUID, to point: NSPoint) {}
+    func endDraggingTab(id: UUID) {}
 }
 private let renameDelegate = RenameDelegateCheck()
 private let tabView = TabButtonView(tabID: UUID(), delegate: renameDelegate)
@@ -116,4 +119,62 @@ field.currentEditor()?.string = "Cancelled name"
 tabView.finishRenaming(commit: false)
 check(renameDelegate.committed == "New name", "Escape keeps the previous name")
 
+
+
+// Layout calculations cover both sparse and very crowded tab strips.
+for width: CGFloat in [340, 480, 920, 1440] {
+    for count in [1, 2, 6, 40, 200] {
+        let layout = TabStripLayout(windowWidth: width, count: count)
+        check(layout.viewportWidth + 232 + (layout.showsOverflow ? 32 : 0) <= width,
+              "Tab controls fit a \(width)-point window with \(count) tabs")
+        check(layout.tabWidth >= 80 && layout.tabWidth <= 240, "Tab widths stay usable")
+        check(layout.contentWidth >= layout.viewportWidth, "Scrollable content covers its viewport")
+        check(layout.frame(at: count - 1).maxX <= layout.contentWidth, "Last tab stays in scrollable content")
+    }
+}
+
+private extension MainWindowController {
+    func checkCrowdedTabs() throws {
+        for index in 1...39 {
+            createNewTab()
+            activeDocument?.customTitle = "Check \(index)"
+        }
+        refreshTabs()
+        let ids = documents.map(\.id)
+        check(ids.count == 40, "Forty tabs are open")
+        check(tabButtonsByID.count == 40, "Every tab remains in the strip")
+        window!.contentView!.layoutSubtreeIfNeeded()
+        window!.setContentSize(NSSize(width: 340, height: 300))
+        windowDidResize(Notification(name: NSWindow.didResizeNotification))
+        check(abs(window!.contentView!.bounds.width - 340) < 1, "Crowded window shrinks to 340 points")
+        check(tabScrollView.frame.maxX < minimizeButton.frame.minX, "Tab viewport doesn't overlap window controls")
+        check(tabScrollView.contentView.bounds.maxX >= tabButtonsByID[ids.last!]!.frame.maxX,
+              "New active tab scrolls into view")
+        let activeID = activeDocumentID
+        let originalEditor = documents[0].textView
+        check(moveTab(id: ids[0], to: 39), "First tab can move to the end")
+        refreshTabs()
+        check(documents.last?.id == ids[0] && documents.last?.textView === originalEditor,
+              "Reorder retains the same document and editor")
+        check(activeDocumentID == activeID, "Reorder doesn't change active document")
+        check(moveTab(id: ids[0], to: 0), "Tab can move back to the beginning")
+        check(documents.map(\.id) == ids, "Both drag directions preserve order")
+        remove(document: documents[0], createReplacement: false)
+        check(activeDocumentID == activeID, "Closing a background tab preserves active tab")
+        selectAdjacentTab(backward: false)
+        check(activeDocumentID == documents.first?.id, "Next tab wraps around")
+        selectAdjacentTab(backward: true)
+        check(activeDocumentID == documents.last?.id, "Previous tab wraps around")
+        _ = moveTab(id: documents[0].id, to: documents.count - 1)
+        let titles = documents.map(\.displayTitle)
+        persistSessionSynchronously()
+        let restored = MainWindowController()
+        check(restored.documents.map(\.displayTitle) == titles, "Reordered tab names persist on restart")
+        // Cancel delayed saves before the temporary session directory is removed.
+        sessionSaveWorkItem?.cancel()
+        restored.sessionSaveWorkItem?.cancel()
+    }
+}
+private let crowdedController = MainWindowController()
+try crowdedController.checkCrowdedTabs()
 print("Passed \(checkCount) behavior checks")

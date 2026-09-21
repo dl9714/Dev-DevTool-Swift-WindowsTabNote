@@ -7,4 +7,4 @@ trap 'rm -rf "$CHECK_DIR"' EXIT
 cat "$PROJECT_DIR/Sources/main.swift" "$PROJECT_DIR/Tests/BehaviorChecks.swift" > "$CHECK_DIR/main.swift"
 swiftc -swift-version 5 -D BEHAVIOR_CHECKS -framework AppKit -framework UniformTypeIdentifiers \
     "$CHECK_DIR/main.swift" -o "$CHECK_DIR/checks"
-"$CHECK_DIR/checks"
+WINDOWSTABNOTE_SESSION_DIRECTORY="$CHECK_DIR/session" "$CHECK_DIR/checks"

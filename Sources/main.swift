@@ -3,7 +3,7 @@ import UniformTypeIdentifiers
 
 private let appDisplayName = "윈도우탭노트"
 private let appEnglishName = "WindowsTabNote"
-private let appDisplayVersion = "2026.09.21.026"
+private let appDisplayVersion = "2026.09.21.028"
 
 private enum TabTitleBuilder {
     static let fallback = "제목 없음"
@@ -431,18 +431,105 @@ private final class DocumentTab {
     }
 }
 
+private struct TabStripLayout {
+    static let spacing: CGFloat = 4
+    let viewportWidth: CGFloat
+    let tabWidth: CGFloat
+    let contentWidth: CGFloat
+    let showsOverflow: Bool
+
+    init(windowWidth: CGFloat, count: Int, heldTabWidth: CGFloat? = nil, heldViewportWidth: CGFloat? = nil) {
+        let count = max(1, count)
+        let gaps = CGFloat(count - 1) * Self.spacing + 10
+        let minimumTabWidth: CGFloat = 80
+        let maximumTabWidth: CGFloat = 240
+        let available = max(60, windowWidth - 232)
+        showsOverflow = CGFloat(count) * minimumTabWidth + gaps > available
+        let maximumViewport = max(60, available - (showsOverflow ? 32 : 0))
+        let naturalWidth = CGFloat(count) * maximumTabWidth + gaps
+        viewportWidth = min(maximumViewport, heldViewportWidth ?? naturalWidth)
+        let fittedWidth = (viewportWidth - gaps) / CGFloat(count)
+        tabWidth = max(minimumTabWidth, min(heldTabWidth ?? maximumTabWidth, fittedWidth))
+        contentWidth = max(viewportWidth, CGFloat(count) * tabWidth + gaps)
+    }
+
+    func frame(at index: Int) -> NSRect {
+        NSRect(x: 5 + CGFloat(index) * (tabWidth + Self.spacing), y: 1, width: tabWidth, height: 36)
+    }
+
+    func index(at centerX: CGFloat, count: Int) -> Int {
+        min(max(0, count - 1), max(0, Int(floor((centerX - 5) / (tabWidth + Self.spacing)))))
+    }
+}
+
+private final class TabScrollView: NSScrollView {
+    override func scrollWheel(with event: NSEvent) {
+        guard let documentView, documentView.bounds.width > contentSize.width else { return }
+        let delta = abs(event.scrollingDeltaX) > abs(event.scrollingDeltaY)
+            ? event.scrollingDeltaX : event.scrollingDeltaY
+        let distance = delta * (event.hasPreciseScrollingDeltas ? 1 : 20)
+        let x = min(max(0, contentView.bounds.minX - distance), documentView.bounds.width - contentSize.width)
+        contentView.scroll(to: NSPoint(x: x, y: 0))
+        reflectScrolledClipView(contentView)
+    }
+}
+
+private final class TabTitleButton: NSButton {
+    var dragBegan: ((NSPoint) -> Void)?
+    var dragMoved: ((NSPoint) -> Void)?
+    var dragEnded: (() -> Void)?
+    var middleClicked: (() -> Void)?
+    private var mouseOrigin: NSPoint?
+    private var dragging = false
+
+    override func mouseDown(with event: NSEvent) {
+        mouseOrigin = event.locationInWindow
+        dragging = false
+        isHighlighted = true
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let mouseOrigin else { return }
+        if !dragging, hypot(event.locationInWindow.x - mouseOrigin.x, event.locationInWindow.y - mouseOrigin.y) >= 5 {
+            dragging = true
+            isHighlighted = false
+            dragBegan?(mouseOrigin)
+        }
+        if dragging { dragMoved?(event.locationInWindow) }
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        guard mouseOrigin != nil else { return }
+        mouseOrigin = nil
+        isHighlighted = false
+        if dragging {
+            dragging = false
+            dragEnded?()
+        } else if bounds.contains(convert(event.locationInWindow, from: nil)) {
+            performClick(nil)
+        }
+    }
+
+    override func otherMouseUp(with event: NSEvent) {
+        if event.buttonNumber == 2 { middleClicked?() } else { super.otherMouseUp(with: event) }
+    }
+}
+
 private protocol TabButtonDelegate: AnyObject {
     func selectTab(id: UUID)
     func closeTab(id: UUID)
     func beginRenamingTab(id: UUID)
     func renameTab(id: UUID, title: String)
+    func beginDraggingTab(id: UUID, at point: NSPoint)
+    func dragTab(id: UUID, to point: NSPoint)
+    func endDraggingTab(id: UUID)
 }
 
 private final class TabButtonView: NSView, NSTextFieldDelegate {
     let tabID: UUID
     weak var delegate: TabButtonDelegate?
 
-    private let titleButton = NSButton()
+    private let titleButton = TabTitleButton()
     private let closeButton = NSButton()
     private let titleField = NSTextField()
     private(set) var isRenaming = false
@@ -463,6 +550,20 @@ private final class TabButtonView: NSView, NSTextFieldDelegate {
         titleButton.target = self
         titleButton.action = #selector(selectPressed)
         titleButton.translatesAutoresizingMaskIntoConstraints = false
+        titleButton.setContentCompressionResistancePriority(.init(1), for: .horizontal)
+        titleButton.dragBegan = { [weak self] point in
+            guard let self else { return }
+            self.delegate?.beginDraggingTab(id: self.tabID, at: point)
+        }
+        titleButton.dragMoved = { [weak self] point in
+            guard let self else { return }
+            self.delegate?.dragTab(id: self.tabID, to: point)
+        }
+        titleButton.dragEnded = { [weak self] in
+            guard let self else { return }
+            self.delegate?.endDraggingTab(id: self.tabID)
+        }
+        titleButton.middleClicked = { [weak self] in self?.closePressed() }
 
         titleField.font = titleButton.font
         titleField.isEditable = true
@@ -477,6 +578,7 @@ private final class TabButtonView: NSView, NSTextFieldDelegate {
         titleField.setAccessibilityLabel("탭 이름")
         titleField.toolTip = "Enter: 이름 확정 · Esc: 취소"
         titleField.translatesAutoresizingMaskIntoConstraints = false
+        titleField.setContentCompressionResistancePriority(.init(1), for: .horizontal)
 
         closeButton.title = ""
         closeButton.image = NSImage(
@@ -517,7 +619,7 @@ private final class TabButtonView: NSView, NSTextFieldDelegate {
 
     func update(title: String, selected: Bool, toolTip: String?) {
         titleButton.title = title
-        titleButton.toolTip = "\(toolTip ?? title)\n클릭하여 탭 이름 변경"
+        titleButton.toolTip = "\(toolTip ?? title)\n클릭: 이름 변경 · 드래그: 순서 변경 · 가운데 클릭: 닫기"
         titleField.textColor = WindowsPalette.text
         titleField.backgroundColor = WindowsPalette.editor
         titleButton.contentTintColor = selected ? WindowsPalette.text : WindowsPalette.secondaryText
@@ -585,8 +687,10 @@ private final class MainWindowController: NSWindowController,
     private var documentByTextView: [ObjectIdentifier: DocumentTab] = [:]
     private var restoredSelectionByDocumentID: [UUID: NSRange] = [:]
     private var tabButtonsByID: [UUID: TabButtonView] = [:]
-    private var tabWidthConstraintsByID: [UUID: NSLayoutConstraint] = [:]
-    private var rapidCloseAnchorX: CGFloat?
+    private var draggingTabID: UUID?
+    private var dragOffsetX: CGFloat = 0
+    private var dragPoint: NSPoint?
+    private var dragScrollTimer: Timer?
     private var rapidCloseStripWidth: CGFloat?
     private var rapidCloseTabWidth: CGFloat?
     private var keyboardMonitor: Any?
@@ -601,9 +705,8 @@ private final class MainWindowController: NSWindowController,
 
     private let rootView = NSView()
     private let tabBar = WindowsChromeView()
-    private let tabScrollView = NSScrollView()
+    private let tabScrollView = TabScrollView()
     private let tabDocumentView = FlippedView()
-    private let tabStack = NSStackView()
     private let appIconView = NSImageView()
     private let tabOverflowButton = HoverButton()
     private let addTabButton = HoverButton()
@@ -668,6 +771,7 @@ private final class MainWindowController: NSWindowController,
     }
 
     deinit {
+        dragScrollTimer?.invalidate()
         sessionSaveWorkItem?.cancel()
         NotificationCenter.default.removeObserver(self)
         if let keyboardMonitor {
@@ -700,11 +804,6 @@ private final class MainWindowController: NSWindowController,
         tabScrollView.horizontalScrollElasticity = .none
         tabScrollView.translatesAutoresizingMaskIntoConstraints = false
 
-        tabStack.orientation = .horizontal
-        tabStack.alignment = .centerY
-        tabStack.distribution = .fill
-        tabStack.spacing = 5
-        tabDocumentView.addSubview(tabStack)
 
         appIconView.image = NSApp.applicationIconImage
         appIconView.imageScaling = .scaleProportionallyUpOrDown
@@ -822,6 +921,8 @@ private final class MainWindowController: NSWindowController,
         statusBar.addSubview(documentStatusLabel)
 
         tabScrollWidthConstraint = tabScrollView.widthAnchor.constraint(equalToConstant: 248)
+        // A required current width becomes AppKit's live-resize minimum.
+        tabScrollWidthConstraint?.priority = .defaultLow
         tabScrollWidthConstraint?.isActive = true
         tabOverflowWidthConstraint = tabOverflowButton.widthAnchor.constraint(equalToConstant: 0)
         tabOverflowWidthConstraint?.isActive = true
@@ -851,6 +952,7 @@ private final class MainWindowController: NSWindowController,
             appIconView.heightAnchor.constraint(equalToConstant: 20),
 
             tabScrollView.leadingAnchor.constraint(equalTo: appIconView.trailingAnchor, constant: 10),
+            tabScrollView.widthAnchor.constraint(greaterThanOrEqualToConstant: 60),
             tabScrollView.topAnchor.constraint(equalTo: tabBar.topAnchor, constant: 7),
             tabScrollView.bottomAnchor.constraint(equalTo: tabBar.bottomAnchor, constant: -2),
 
@@ -1485,134 +1587,68 @@ private final class MainWindowController: NSWindowController,
         }
     }
 
-    private func tabLayout(proposedWindowWidth: CGFloat? = nil) -> (
-        visibleDocuments: [DocumentTab],
-        stripWidth: CGFloat,
-        tabWidth: CGFloat,
-        showsOverflow: Bool
-    ) {
-        let windowWidth = proposedWindowWidth ?? window?.contentView?.bounds.width ?? 920
-        let stackSpacing = tabStack.spacing
-        let minimumStripWidth: CGFloat = 72
-        let chromeWidthWithoutOverflow: CGFloat = 232
-        let overflowControlSpace: CGFloat = 32
-        let minimumReadableTabWidth: CGFloat = 116
-
-        func capacity(for stripWidth: CGFloat) -> Int {
-            let usableWidth = max(0, stripWidth - 12)
-            return max(1, Int(floor((usableWidth + stackSpacing) / (minimumReadableTabWidth + stackSpacing))))
-        }
-
-        let widthWithoutOverflow = max(minimumStripWidth, windowWidth - chromeWidthWithoutOverflow)
-        let needsOverflow = documents.count > capacity(for: widthWithoutOverflow)
-        let maximumAvailableWidth = max(
-            minimumStripWidth,
-            windowWidth - chromeWidthWithoutOverflow - (needsOverflow ? overflowControlSpace : 0)
-        )
-        let visibleCapacity = min(documents.count, capacity(for: maximumAvailableWidth))
-        let showsOverflow = documents.count > visibleCapacity
-
-        var visibleDocuments = Array(documents.prefix(visibleCapacity))
-        if showsOverflow,
-           visibleCapacity > 0,
-           let activeDocument,
-           !visibleDocuments.contains(where: { $0.id == activeDocument.id }) {
-            visibleDocuments[visibleCapacity - 1] = activeDocument
-        }
-
-        let naturalWidth = CGFloat(max(1, visibleDocuments.count)) * 245 + 8
-        let stripWidth = min(maximumAvailableWidth, naturalWidth)
-        let gapWidth = CGFloat(max(0, visibleDocuments.count - 1)) * stackSpacing
-        let fittedWidth = visibleDocuments.isEmpty
-            ? 240
-            : (stripWidth - gapWidth - 12) / CGFloat(visibleDocuments.count)
-        let tabWidth = rapidCloseTabWidth ?? min(240, max(60, fittedWidth))
-        if let rapidCloseStripWidth {
-            return (
-                visibleDocuments,
-                min(maximumAvailableWidth, rapidCloseStripWidth),
-                tabWidth,
-                showsOverflow
-            )
-        }
-        return (visibleDocuments, stripWidth, tabWidth, showsOverflow)
+    private func tabLayout(proposedWindowWidth: CGFloat? = nil) -> TabStripLayout {
+        TabStripLayout(windowWidth: proposedWindowWidth ?? window?.contentView?.bounds.width ?? 920,
+                       count: documents.count, heldTabWidth: rapidCloseTabWidth,
+                       heldViewportWidth: rapidCloseStripWidth)
     }
 
     private func refreshTabs() {
-        let layout = tabLayout()
-        let currentIDs = tabStack.arrangedSubviews.compactMap { ($0 as? TabButtonView)?.tabID }
-        let wantedIDs = layout.visibleDocuments.map(\.id)
-        if currentIDs != wantedIDs {
-            tabButtonsByID.values.forEach { $0.finishRenaming(commit: true) }
-            tabButtonsByID.removeAll(keepingCapacity: true)
-            tabWidthConstraintsByID.removeAll(keepingCapacity: true)
-            for view in tabStack.arrangedSubviews {
-                tabStack.removeArrangedSubview(view)
-                view.removeFromSuperview()
-            }
-            for document in layout.visibleDocuments {
-                let tab = TabButtonView(tabID: document.id, delegate: self)
-                tab.translatesAutoresizingMaskIntoConstraints = false
-                let widthConstraint = tab.widthAnchor.constraint(equalToConstant: 240)
-                widthConstraint.isActive = true
-                tab.heightAnchor.constraint(equalToConstant: 36).isActive = true
-                tabStack.addArrangedSubview(tab)
-                tabButtonsByID[document.id] = tab
-                tabWidthConstraintsByID[document.id] = widthConstraint
-            }
+        let wantedIDs = Set(documents.map(\.id))
+        for id in Array(tabButtonsByID.keys) where !wantedIDs.contains(id) {
+            tabButtonsByID[id]?.finishRenaming(commit: true)
+            tabButtonsByID.removeValue(forKey: id)?.removeFromSuperview()
         }
-
-        layout.visibleDocuments.forEach(updateTabAppearance)
-
-        tabOverflowButton.isHidden = !layout.showsOverflow
-        tabOverflowWidthConstraint?.constant = layout.showsOverflow ? 32 : 0
-        tabOverflowButton.setAccessibilityLabel(
-            layout.showsOverflow ? "모든 탭, 총 \(documents.count)개" : "모든 탭"
-        )
-
-        updateTabDocumentSize(using: layout)
+        for document in documents {
+            if tabButtonsByID[document.id] == nil {
+                let tab = TabButtonView(tabID: document.id, delegate: self)
+                tabDocumentView.addSubview(tab)
+                tabButtonsByID[document.id] = tab
+            }
+            updateTabAppearance(for: document)
+        }
+        if draggingTabID == nil,
+           tabDocumentView.subviews.compactMap({ ($0 as? TabButtonView)?.tabID }) != documents.map(\.id) {
+            tabDocumentView.subviews = documents.compactMap { tabButtonsByID[$0.id] }
+        }
+        updateTabDocumentSize()
+        if draggingTabID == nil { revealActiveTab() }
         updateWindowTitle()
     }
 
     private func updateTabAppearance(for document: DocumentTab) {
-        tabButtonsByID[document.id]?.update(
-            title: document.tabTitle,
-            selected: document.id == activeDocumentID,
-            toolTip: document.url?.path
-        )
+        tabButtonsByID[document.id]?.update(title: document.tabTitle,
+                                           selected: document.id == activeDocumentID,
+                                           toolTip: document.url?.path)
     }
 
-    private func updateTabDocumentSize(using layout: (
-        visibleDocuments: [DocumentTab],
-        stripWidth: CGFloat,
-        tabWidth: CGFloat,
-        showsOverflow: Bool
-    )? = nil) {
+    private func updateTabDocumentSize() {
+        let layout = tabLayout()
+        tabScrollWidthConstraint?.constant = layout.viewportWidth
+        tabOverflowButton.isHidden = !layout.showsOverflow
+        tabOverflowWidthConstraint?.constant = layout.showsOverflow ? 32 : 0
+        tabOverflowButton.setAccessibilityLabel(layout.showsOverflow ? "모든 탭, 총 \(documents.count)개" : "모든 탭")
         tabBar.layoutSubtreeIfNeeded()
-        let tabLayout = layout ?? self.tabLayout()
-        tabWidthConstraintsByID.values.forEach { $0.constant = tabLayout.tabWidth }
-        tabScrollWidthConstraint?.constant = tabLayout.stripWidth
-        let height = max(tabScrollView.contentSize.height, 38)
-        tabDocumentView.frame = NSRect(x: 0, y: 0, width: tabLayout.stripWidth, height: height)
-        let visibleTabCount = tabStack.arrangedSubviews.count
-        let groupWidth = CGFloat(visibleTabCount) * tabLayout.tabWidth +
-            CGFloat(max(0, visibleTabCount - 1)) * tabStack.spacing
-        var stackOriginX: CGFloat = 5
-        if let rapidCloseAnchorX,
-           let activeDocumentID,
-           let activeIndex = tabStack.arrangedSubviews
-            .compactMap({ ($0 as? TabButtonView)?.tabID })
-            .firstIndex(of: activeDocumentID) {
-            let closeCenterInStack = CGFloat(activeIndex) * (tabLayout.tabWidth + tabStack.spacing) +
-                tabLayout.tabWidth - 17
-            let maximumOrigin = max(5, tabLayout.stripWidth - groupWidth - 5)
-            stackOriginX = min(maximumOrigin, max(5, rapidCloseAnchorX - closeCenterInStack))
+        tabDocumentView.frame = NSRect(x: 0, y: 0, width: layout.contentWidth,
+                                      height: max(tabScrollView.contentSize.height, 38))
+        for (index, document) in documents.enumerated() {
+            tabButtonsByID[document.id]?.frame = layout.frame(at: index)
         }
-        let stackWidth = max(groupWidth, tabLayout.stripWidth - stackOriginX - 5)
-        tabStack.frame = NSRect(x: stackOriginX, y: 1, width: max(0, stackWidth), height: 36)
-        tabStack.layoutSubtreeIfNeeded()
-        tabScrollView.contentView.scroll(to: .zero)
-        tabScrollView.reflectScrolledClipView(tabScrollView.contentView)
+        let clip = tabScrollView.contentView
+        clip.scroll(to: NSPoint(x: min(clip.bounds.minX, max(0, layout.contentWidth - clip.bounds.width)), y: 0))
+        tabScrollView.reflectScrolledClipView(clip)
+    }
+
+    private func revealActiveTab() {
+        guard let id = activeDocumentID, let tab = tabButtonsByID[id] else { return }
+        let clip = tabScrollView.contentView
+        let visible = clip.bounds
+        var x = visible.minX
+        if tab.frame.minX < visible.minX { x = tab.frame.minX - 5 }
+        if tab.frame.maxX > visible.maxX { x = tab.frame.maxX - visible.width + 5 }
+        x = min(max(0, x), max(0, tabDocumentView.bounds.width - visible.width))
+        clip.scroll(to: NSPoint(x: x, y: 0))
+        tabScrollView.reflectScrolledClipView(clip)
     }
 
     private func updateWindowTitle() {
@@ -1776,7 +1812,7 @@ private final class MainWindowController: NSWindowController,
 
         if documents.isEmpty {
             activeDocumentID = nil
-        } else {
+        } else if activeDocumentID == document.id {
             activeDocumentID = documents[min(index, documents.count - 1)].id
         }
         refreshTabs()
@@ -1799,23 +1835,18 @@ private final class MainWindowController: NSWindowController,
     }
 
     private func beginRapidTabClosing(for id: UUID) {
-        guard documents.count > 1,
-              let tab = tabButtonsByID[id],
-              let widthConstraint = tabWidthConstraintsByID[id] else { return }
-        tabStack.layoutSubtreeIfNeeded()
-        rapidCloseAnchorX = tabStack.frame.minX + tab.frame.maxX - 17
-        rapidCloseStripWidth = tabDocumentView.frame.width
-        rapidCloseTabWidth = widthConstraint.constant
+        guard documents.count > 1, let tab = tabButtonsByID[id] else { return }
+        rapidCloseStripWidth = tabScrollView.contentSize.width
+        rapidCloseTabWidth = tab.frame.width
     }
 
     private func resetRapidTabClosing() {
-        rapidCloseAnchorX = nil
         rapidCloseStripWidth = nil
         rapidCloseTabWidth = nil
     }
 
     private func finishRapidTabClosing() {
-        guard rapidCloseAnchorX != nil else { return }
+        guard rapidCloseTabWidth != nil else { return }
         resetRapidTabClosing()
         refreshTabs()
     }
@@ -1825,6 +1856,10 @@ private final class MainWindowController: NSWindowController,
             guard let self,
                   self.window?.isKeyWindow == true else { return event }
             let modifiers = event.modifierFlags.intersection([.command, .option, .control, .shift])
+            if event.keyCode == 48 && (modifiers == .control || modifiers == [.control, .shift]) {
+                self.selectAdjacentTab(backward: modifiers.contains(.shift))
+                return nil
+            }
             let isControlCharacter = event.characters == "\u{17}" ||
                 event.charactersIgnoringModifiers == "\u{17}"
             let isPhysicalControlW = modifiers == .control && event.keyCode == 13
@@ -1835,7 +1870,7 @@ private final class MainWindowController: NSWindowController,
         mouseMonitor = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .leftMouseDragged]) {
             [weak self] event in
             guard let self,
-                  self.rapidCloseAnchorX != nil,
+                  self.rapidCloseTabWidth != nil,
                   event.window === self.window else { return event }
             let locationInTabBar = self.tabBar.convert(event.locationInWindow, from: nil)
             if !self.tabBar.bounds.contains(locationInTabBar) {
@@ -1891,6 +1926,71 @@ private final class MainWindowController: NSWindowController,
         scheduleSessionSave()
     }
 
+    private func selectAdjacentTab(backward: Bool) {
+        guard documents.count > 1,
+              let index = documents.firstIndex(where: { $0.id == activeDocumentID }) else { return }
+        let next = (index + (backward ? documents.count - 1 : 1)) % documents.count
+        selectTab(id: documents[next].id)
+    }
+
+    @discardableResult
+    private func moveTab(id: UUID, to destination: Int) -> Bool {
+        guard let source = documents.firstIndex(where: { $0.id == id }) else { return false }
+        let destination = min(max(0, destination), documents.count - 1)
+        guard source != destination else { return false }
+        let document = documents.remove(at: source)
+        documents.insert(document, at: destination)
+        return true
+    }
+
+    func beginDraggingTab(id: UUID, at point: NSPoint) {
+        guard let tab = tabButtonsByID[id] else { return }
+        dragScrollTimer?.invalidate()
+        dragOffsetX = tabDocumentView.convert(point, from: nil).x - tab.frame.minX
+        draggingTabID = id
+        dragPoint = point
+        selectTab(id: id)
+        tabDocumentView.addSubview(tab, positioned: .above, relativeTo: nil)
+        tab.alphaValue = 0.85
+        let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in
+            guard let self, let id = self.draggingTabID, let point = self.dragPoint else { return }
+            self.dragTab(id: id, to: point)
+        }
+        dragScrollTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    func dragTab(id: UUID, to point: NSPoint) {
+        guard draggingTabID == id, let tab = tabButtonsByID[id] else { return }
+        dragPoint = point
+        let clip = tabScrollView.contentView
+        let mouseX = tabScrollView.convert(point, from: nil).x
+        var scrollX = clip.bounds.minX
+        if mouseX < 24 { scrollX -= 16 }
+        if mouseX > clip.bounds.width - 24 { scrollX += 16 }
+        scrollX = min(max(0, scrollX), max(0, tabDocumentView.bounds.width - clip.bounds.width))
+        clip.scroll(to: NSPoint(x: scrollX, y: 0))
+        tabScrollView.reflectScrolledClipView(clip)
+
+        let layout = tabLayout()
+        let x = tabDocumentView.convert(point, from: nil).x - dragOffsetX
+        let destination = layout.index(at: x + layout.tabWidth / 2, count: documents.count)
+        _ = moveTab(id: id, to: destination)
+        updateTabDocumentSize()
+        tab.frame.origin.x = min(max(0, x), max(0, layout.contentWidth - layout.tabWidth))
+    }
+
+    func endDraggingTab(id: UUID) {
+        guard draggingTabID == id else { return }
+        dragScrollTimer?.invalidate()
+        dragScrollTimer = nil
+        dragPoint = nil
+        draggingTabID = nil
+        tabButtonsByID[id]?.alphaValue = 1
+        refreshTabs()
+        scheduleSessionSave()
+    }
+
     func closeTab(id: UUID) {
         guard let document = documents.first(where: { $0.id == id }) else { return }
         beginRapidTabClosing(for: id)
@@ -1943,7 +2043,7 @@ private final class MainWindowController: NSWindowController,
         resetRapidTabClosing()
         updateResponsiveLayout(for: frameSize.width)
         let layout = tabLayout(proposedWindowWidth: frameSize.width)
-        tabScrollWidthConstraint?.constant = layout.stripWidth
+        tabScrollWidthConstraint?.constant = layout.viewportWidth
         tabOverflowButton.isHidden = !layout.showsOverflow
         tabOverflowWidthConstraint?.constant = layout.showsOverflow ? 32 : 0
         return frameSize
